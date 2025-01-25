@@ -3,10 +3,11 @@ package lite
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json" 
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"strings"
 	"time"
@@ -155,13 +156,18 @@ func findRoute(
 		return log, src, route, nil, errors.New("no backend configured for route")
 	}
 
+	// Make a copy and shuffle the backends for load balancing
 	tryBackends := route.Backend.Copy()
+	rand.Shuffle(len(tryBackends), func(i, j int) {
+		tryBackends[i], tryBackends[j] = tryBackends[j], tryBackends[i]
+	})
+	
 	nextBackend = func() (string, logr.Logger, bool) {
 		if len(tryBackends) == 0 {
 			return "", log, false
 		}
-		// Pop first backend
-		backend := tryBackends[0]
+		// Pop random backend
+		backend := tryBackends[0] 
 		tryBackends = tryBackends[1:]
 
 		dstAddr, err := netutil.Parse(backend, src.RemoteAddr().Network())
