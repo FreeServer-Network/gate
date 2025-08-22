@@ -13,13 +13,16 @@ import (
 // JsonCodec returns the appropriate codec for the given protocol version.
 // This is used to constrain messages sent to older clients.
 func JsonCodec(protocol proto.Protocol) codec.Codec {
-	if protocol.GreaterEqual(version.Minecraft_1_20_3) {
+	if protocol.GreaterEqual(version.Minecraft_1_21_5) {
 		return jsonCodec_Modern
 	}
-	if protocol.GreaterEqual(version.Minecraft_1_16) {
-		return jsonCodec_pre_1_20_3
+	if protocol.GreaterEqual(version.Minecraft_1_20_3) {
+		return jsonCodec_Pre_1_21_5
 	}
-	return jsonCodec_pre_1_16
+	if protocol.GreaterEqual(version.Minecraft_1_16) {
+		return jsonCodec_Pre_1_20_3
+	}
+	return jsonCodec_Pre_1_16
 }
 
 // Marshal marshals a component into JSON.
@@ -35,72 +38,25 @@ func LatestJsonCodec() codec.Codec {
 
 // DefaultJsonCodec returns a legacy supportive codec.
 func DefaultJsonCodec() codec.Codec {
-	return jsonCodec_pre_1_16
+	return jsonCodec_Pre_1_16
 }
 
 var (
 	// Json component codec supporting pre-1.16 clients
-	jsonCodec_pre_1_16 = &codec.Json{
-		/* TODO https://github.com/PaperMC/Velocity/blob/00ef92bc5c82c46ed4770aaaf126c285a6ab705c/proxy/src/main/java/com/velocitypowered/proxy/protocol/ProtocolUtils.java#L58
-		 GsonComponentSerializer.builder()
-		  .downsampleColors()
-		  .emitLegacyHoverEvent()
-		  .legacyHoverEventSerializer(VelocityLegacyHoverEventSerializer.INSTANCE)
-		  .options(
-			  OptionState.optionState()
-			  // before 1.16
-			  .value(JSONOptions.EMIT_RGB, Boolean.FALSE)
-			  .value(JSONOptions.EMIT_HOVER_EVENT_TYPE, JSONOptions.HoverEventValueMode.LEGACY_ONLY)
-			  // before 1.20.3
-			  .value(JSONOptions.EMIT_COMPACT_TEXT_COMPONENT, Boolean.FALSE)
-			  .value(JSONOptions.EMIT_HOVER_SHOW_ENTITY_ID_AS_INT_ARRAY, Boolean.FALSE)
-			  .value(JSONOptions.VALIDATE_STRICT_EVENTS, Boolean.FALSE)
-			  .build()
-		  )
-		  .build();
-		*/
-	}
-	// Json component codec for 1.16+ clients
-	jsonCodec_pre_1_20_3 = &codec.Json{
-		NoDownsampleColor: true,
-		NoLegacyHover:     true,
-		/* TODO
-		GsonComponentSerializer.builder()
-		  .legacyHoverEventSerializer(VelocityLegacyHoverEventSerializer.INSTANCE)
-		  .options(
-			  OptionState.optionState()
-			  // after 1.16
-			  .value(JSONOptions.EMIT_RGB, Boolean.TRUE)
-			  .value(JSONOptions.EMIT_HOVER_EVENT_TYPE, JSONOptions.HoverEventValueMode.MODERN_ONLY)
-			  // before 1.20.3
-			  .value(JSONOptions.EMIT_COMPACT_TEXT_COMPONENT, Boolean.FALSE)
-			  .value(JSONOptions.EMIT_HOVER_SHOW_ENTITY_ID_AS_INT_ARRAY, Boolean.FALSE)
-			  .value(JSONOptions.VALIDATE_STRICT_EVENTS, Boolean.FALSE)
-			  .build()
-		  )
-		  .build();
-		*/
-	}
-	jsonCodec_Modern = &codec.Json{
-		NoDownsampleColor: true,
-		NoLegacyHover:     true,
-		/* TODO
-				GsonComponentSerializer.builder()
-		          .legacyHoverEventSerializer(VelocityLegacyHoverEventSerializer.INSTANCE)
-		          .options(
-		              OptionState.optionState()
-		              // after 1.16
-		              .value(JSONOptions.EMIT_RGB, Boolean.TRUE)
-		              .value(JSONOptions.EMIT_HOVER_EVENT_TYPE, JSONOptions.HoverEventValueMode.MODERN_ONLY)
-		              // after 1.20.3
-		              .value(JSONOptions.EMIT_COMPACT_TEXT_COMPONENT, Boolean.TRUE)
-		              .value(JSONOptions.EMIT_HOVER_SHOW_ENTITY_ID_AS_INT_ARRAY, Boolean.TRUE)
-		              .value(JSONOptions.VALIDATE_STRICT_EVENTS, Boolean.TRUE)
-		              .build()
-		          )
-		          .build();
-		*/
-	}
+	// Equivalent to PRE_1_16_SERIALIZER from Adventure
+	jsonCodec_Pre_1_16 = codec.JsonPre1_16
+
+	// Json component codec for 1.16+ clients (pre-1.20.3)
+	// Equivalent to PRE_1_20_3_SERIALIZER from Adventure
+	jsonCodec_Pre_1_20_3 = codec.JsonPre1_20_3
+
+	// Json component codec for 1.20.3+ clients (pre-1.21.5)
+	// Equivalent to PRE_1_21_5_SERIALIZER from Adventure
+	jsonCodec_Pre_1_21_5 = codec.JsonPre1_21_5
+
+	// Json component codec for 1.21.5+ clients (modern format)
+	// Equivalent to MODERN_SERIALIZER from Adventure
+	jsonCodec_Modern = codec.JsonModern
 )
 
 // MarshalPlain marshals a component into plain text.
