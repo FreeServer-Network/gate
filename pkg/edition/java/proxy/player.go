@@ -29,6 +29,7 @@ import (
 
 	"go.minekube.com/gate/pkg/edition/java/config"
 	"go.minekube.com/gate/pkg/edition/java/forge/modinfo"
+	"go.minekube.com/gate/pkg/edition/java/lite"
 	"go.minekube.com/gate/pkg/edition/java/netmc"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/chat"
 	"go.minekube.com/gate/pkg/edition/java/proxy/crypto"
@@ -124,6 +125,7 @@ type Player interface { // TODO convert to struct(?) bc this is a lot of methods
 	//  - https://pkg.go.dev/go.minekube.com/gate/pkg/edition/java/bossbar
 	//  - https://pkg.go.dev/go.minekube.com/gate/pkg/edition/java/title
 	//  - https://pkg.go.dev/go.minekube.com/gate/pkg/edition/java/cookie
+	//  - https://pkg.go.dev/go.minekube.com/gate/pkg/edition/java/sound
 	//  - https://pkg.go.dev/go.minekube.com/gate/pkg/edition/java/proxy/tablist
 }
 
@@ -148,7 +150,8 @@ type connectedPlayer struct {
 	clientsideChannels                 *sets.CappedSet[string]
 	pendingConfigurationSwitch         bool
 
-	tabList internaltablist.InternalTabList // Player's tab list
+	tabList        internaltablist.InternalTabList // Player's tab list
+	bossBarManager *bossBarManager                 // Boss bar manager for 1.20.2+
 
 	mu                   sync.RWMutex // Protects following fields
 	connectedServer_     *serverConnection
@@ -199,10 +202,15 @@ func newConnectedPlayer(
 	p.bundleHandler = &resourcepack.BundleDelimiterHandler{Player: p}
 	p.chatQueue = newChatQueue(p)
 	p.tabList = internaltablist.New(p)
+	p.bossBarManager = newBossBarManager(p)
 	return p
 }
 
 func (p *connectedPlayer) IdentifiedKey() crypto.IdentifiedKey { return p.playerKey }
+
+// BossBarManager returns the player's boss bar manager.
+// It is used to handle proxy-level boss bars during server transitions on 1.20.2+.
+func (p *connectedPlayer) BossBarManager() *bossBarManager { return p.bossBarManager }
 
 func (p *connectedPlayer) connectionInFlight() *serverConnection {
 	p.mu.RLock()
@@ -489,7 +497,9 @@ func (p *connectedPlayer) nextServerToTry(current RegisteredServer) RegisteredSe
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.serversToTry) == 0 {
-		p.serversToTry = p.config().ForcedHosts[p.virtualHost.String()]
+		// Extract hostname from virtual host and convert to lowercase
+		virtualHostStr := p.getVirtualHostname()
+		p.serversToTry = p.config().ForcedHosts[virtualHostStr]
 	}
 	if len(p.serversToTry) == 0 {
 		connOrder := p.config().Try
@@ -518,6 +528,23 @@ func (p *connectedPlayer) nextServerToTry(current RegisteredServer) RegisteredSe
 		}
 	}
 	return nil
+}
+
+// getVirtualHostname extracts the hostname from the virtual host address and converts it to lowercase.
+func (p *connectedPlayer) getVirtualHostname() string {
+	if p.virtualHost == nil {
+		return ""
+	}
+
+	// Use Gate's existing utility functions to clean the virtual host
+	// 1. Clear virtual host (removes forge separators, TCPShield separators, etc.)
+	// 2. Extract hostname (removes port)
+	// 3. Convert to lowercase for consistent matching
+	virtualHostStr := p.virtualHost.String()
+	cleanedHost := lite.ClearVirtualHost(virtualHostStr)
+	hostname := netutil.HostStr(cleanedHost)
+
+	return strings.ToLower(hostname)
 }
 
 // player's connection is closed at this point,
@@ -772,4 +799,36 @@ func (p *connectedPlayer) discardChatQueue() {
 
 func (p *connectedPlayer) HandshakeIntent() packet.HandshakeIntent {
 	return p.handshakeIntent
+}
+
+// CurrentServerEntityID returns the entity ID of the player on their current server.
+// Returns false if the player is not connected to a server.
+func (p *connectedPlayer) CurrentServerEntityID() (int, bool) {
+	serverConn := p.connectedServer()
+	if serverConn == nil {
+		return 0, false
+	}
+	return serverConn.entityID, true
+}
+
+// CheckServerMatch checks if the other player is on the same server.
+// This method is used by the sound package to verify emitters are on the same server.
+func (p *connectedPlayer) CheckServerMatch(other interface{ CurrentServerEntityID() (int, bool) }) bool {
+	// Simple implementation: check both have servers
+	thisEntityID, thisOk := p.CurrentServerEntityID()
+	otherEntityID, otherOk := other.CurrentServerEntityID()
+
+	if !thisOk || !otherOk {
+		return false
+	}
+
+	// If we can cast to connectedPlayer, do proper server name check
+	if otherPlayer, ok := other.(*connectedPlayer); ok {
+		thisServer := p.connectedServer()
+		otherServer := otherPlayer.connectedServer()
+		return ServerInfoEqual(thisServer.Server().ServerInfo(), otherServer.Server().ServerInfo())
+	}
+
+	// Fallback: just check both are connected
+	return thisEntityID != 0 && otherEntityID != 0
 }

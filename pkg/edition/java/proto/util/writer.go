@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"go.minekube.com/common/minecraft/component"
+	"go.minekube.com/common/minecraft/key"
 	"go.minekube.com/gate/pkg/edition/java/profile"
 	"go.minekube.com/gate/pkg/gate/proto"
 	"go.minekube.com/gate/pkg/util/uuid"
@@ -220,9 +221,9 @@ func WriteBytes17(wr io.Writer, b []byte, allowExtended bool) error {
 				ForgeMaxArrayLength, len(b))
 		}
 	} else {
-		if len(b) > math.MaxInt8 {
+		if len(b) > math.MaxInt16 {
 			return fmt.Errorf("cannot write byte array longer than %d (got %d bytes)",
-				math.MaxInt8, len(b))
+				math.MaxInt16, len(b))
 		}
 	}
 	// Writes a 2 or 3 byte number that represents the length of the packet. (3 byte "shorts" for
@@ -269,4 +270,8 @@ func WriteComponent(wr io.Writer, protocol proto.Protocol, c component.Component
 		return err
 	}
 	return WriteString(wr, buf.String())
+}
+
+func WriteMinimalKey(wr io.Writer, k key.Key) error {
+	return WriteString(wr, key.Minimal(k))
 }

@@ -1061,6 +1061,26 @@ func (e *PlayerChannelRegisterEvent) Player() Player {
 //
 //
 
+// PlayerChannelUnregisterEvent is fired when a client Player sends a plugin message through the
+// unregister channel. The proxy will not wait on this event to finish firing.
+type PlayerChannelUnregisterEvent struct {
+	channels []message.ChannelIdentifier
+	player   Player
+}
+
+func (e *PlayerChannelUnregisterEvent) Channels() []message.ChannelIdentifier {
+	return e.channels
+}
+
+func (e *PlayerChannelUnregisterEvent) Player() Player {
+	return e.player
+}
+
+//
+//
+//
+//
+
 // ServerLoginPluginMessageEvent is fired when a server sends a login plugin message to the proxy.
 // Plugins have the opportunity to respond to the messages as needed. The proxy will wait on this
 // event to finish. The server will be responsible for continuing the login process once the server
@@ -1131,8 +1151,12 @@ func (e *PlayerClientBrandEvent) Brand() string {
 //
 //
 
-// PreShutdownEvent is fired before the proxy begins to shut down by
-// stopping to accept new connections and disconnect all players.
+// PreShutdownEvent is fired by the proxy after it has stopped accepting new connections,
+// but before any players are disconnected. This is the last opportunity to interact with
+// currently connected players, such as transferring them to another proxy or performing
+// cleanup tasks.
+//
+// The proxy will wait for all event listeners to complete before disconnecting players.
 type PreShutdownEvent struct {
 	reason component.Component // may be nil
 }
@@ -1326,3 +1350,37 @@ func (e *CookieRequestEvent) Allowed() bool { return !e.denied }
 
 // SetAllowed sets whether the cookie request is allowed to be forwarded to the client.
 func (e *CookieRequestEvent) SetAllowed(allowed bool) { e.denied = !allowed }
+
+//
+//
+//
+//
+//
+
+// ServerRegisteredEvent is fired when a backend server is registered with the proxy.
+// This allows plugins to react to dynamically added servers and perform necessary setup.
+type ServerRegisteredEvent struct {
+	server RegisteredServer
+}
+
+// Server returns the server that was registered.
+func (e *ServerRegisteredEvent) Server() RegisteredServer {
+	return e.server
+}
+
+//
+//
+//
+//
+//
+
+// ServerUnregisteredEvent is fired when a backend server is unregistered from the proxy.
+// This allows plugins to react to removed servers and perform necessary cleanup.
+type ServerUnregisteredEvent struct {
+	server ServerInfo
+}
+
+// ServerInfo returns the server info of the server that was unregistered.
+func (e *ServerUnregisteredEvent) ServerInfo() ServerInfo {
+	return e.server
+}

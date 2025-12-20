@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/urfave/cli/v2"
 	"go.minekube.com/gate/pkg/gate"
+	"go.minekube.com/gate/pkg/version"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -41,15 +42,23 @@ func App() *cli.App {
 	app := cli.NewApp()
 	app.Name = "gate"
 	app.Usage = "Gate is an extensible Minecraft proxy."
+	app.Version = version.String()
+	app.HideVersion = true // Hide automatic version flags to avoid conflicts
 	app.Description = `A high performant & paralleled Minecraft proxy server with
 	scalability, flexibility & excelled server version support.
 
 Visit the website https://gate.minekube.com/ for more information.`
 
+	app.Commands = []*cli.Command{
+		configCommand(),
+	}
+
 	var (
-		debug      bool
-		configFile string
-		verbosity  int
+		debug        bool
+		configFile   string
+		verbosity    int
+		showVersion  bool
+		noAutoReload bool
 	)
 	app.Flags = []cli.Flag{
 		&cli.StringFlag{
@@ -73,8 +82,27 @@ Visit the website https://gate.minekube.com/ for more information.`
 			EnvVars:     []string{"GATE_VERBOSITY"},
 			Destination: &verbosity,
 		},
+		&cli.BoolFlag{
+			Name:        "version",
+			Aliases:     []string{"V"},
+			Usage:       "Show version information",
+			Destination: &showVersion,
+		},
+		&cli.BoolFlag{
+			Name:        "no-auto-reload",
+			Usage:       "Disable automatic config file reloading",
+			Destination: &noAutoReload,
+			EnvVars:     []string{"GATE_NO_AUTO_RELOAD"},
+		},
 	}
+
 	app.Action = func(c *cli.Context) error {
+		// Handle version flag (Unix convention: -V for version, -v for verbose)
+		if showVersion {
+			fmt.Printf("gate version %s\n", version.String())
+			return nil
+		}
+
 		// Init viper
 		v, err := initViper(c, configFile)
 		if err != nil {
@@ -92,8 +120,8 @@ Visit the website https://gate.minekube.com/ for more information.`
 		}
 
 		// Flags overwrite config
-		debug = debug || cfg.Editions.Java.Config.Debug
-		cfg.Editions.Java.Config.Debug = debug
+		debug = debug || cfg.Config.Debug
+		cfg.Config.Debug = debug
 
 		if !c.IsSet("verbosity") && debug {
 			verbosity = math.MaxInt8
@@ -112,14 +140,20 @@ Visit the website https://gate.minekube.com/ for more information.`
 			c.Context = logr.NewContext(c.Context, log)
 		}
 
+		// Log startup information
+		log.Info("starting Gate proxy", "version", version.String())
 		log.Info("logging verbosity", "verbosity", verbosity)
 		log.Info("using config file", "config", v.ConfigFileUsed())
 
+		// Check if auto reload is disabled (via flag, env var, or config)
+		disableAutoReload := noAutoReload || cfg.NoAutoReload
+
 		// Start Gate
-		if err = gate.Start(c.Context,
-			gate.WithConfig(*cfg),
-			gate.WithAutoConfigReload(v.ConfigFileUsed()),
-		); err != nil {
+		startOpts := []gate.StartOption{gate.WithConfig(*cfg)}
+		if !disableAutoReload && v.ConfigFileUsed() != "" {
+			startOpts = append(startOpts, gate.WithAutoConfigReload(v.ConfigFileUsed()))
+		}
+		if err = gate.Start(c.Context, startOpts...); err != nil {
 			return cli.Exit(fmt.Errorf("error running Gate: %w", err), 1)
 		}
 		return nil
@@ -139,6 +173,16 @@ func initViper(c *cli.Context, configFile string) (*viper.Viper, error) {
 	v.SetEnvPrefix("GATE")
 	v.AutomaticEnv() // read in environment variables that match
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	// Bind custom environment variables for forwarding secrets
+	if err := v.BindEnv("velocitySecret", "GATE_VELOCITY_SECRET"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable 'GATE_VELOCITY_SECRET': %w", err)
+	}
+
+	if err := v.BindEnv("bungeeGuardSecret", "GATE_BUNGEEGUARD_SECRET"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable 'GATE_BUNGEEGUARD_SECRET': %w", err)
+	}
+
 	return v, nil
 }
 

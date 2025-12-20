@@ -122,7 +122,7 @@ func ReadVarIntReturnN(r io.Reader) (result int, n int, err error) {
 				break
 			}
 		}
-		return int(val), n, nil
+		return int(int32(val)), n, nil
 	}
 
 	var bytesRead byte = 0
@@ -480,4 +480,12 @@ func WriteKeyArray(wr io.Writer, keys []key.Key) error {
 		}
 	}
 	return nil
+}
+
+func ReadMinimalKey(rd io.Reader) (key.Key, error) {
+	str, err := ReadString(rd)
+	if err != nil {
+		return nil, err
+	}
+	return key.New(key.MinecraftNamespace, str), nil
 }
