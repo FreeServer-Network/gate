@@ -15,14 +15,6 @@ const (
 	GEYSER_API_URL = "https://api.geysermc.org/v2/"
 )
 
-// LinkedAccountResult represents a linked Java account from GeyserMC API.
-type LinkedAccountResult struct {
-	BedrockID      int64     `json:"bedrock_id"`
-	JavaID         uuid.UUID `json:"java_id"`
-	JavaName       string    `json:"java_name"`
-	LastNameUpdate int64     `json:"last_name_update"`
-}
-
 // SkinResult represents skin data from GeyserMC API.
 type SkinResult struct {
 	Hash      string `json:"hash"`
@@ -46,7 +38,25 @@ func NewProfileManager() *ProfileManager {
 	}
 }
 
-// GetLinkedAccount retrieves linked Java account information for a Bedrock XUID.
+// LinkedAccountResult represents a linked Java account from the GeyserMC
+// global link API (https://api.geysermc.org/v2/link/bedrock/<xuid>).
+type LinkedAccountResult struct {
+	BedrockID      int64     `json:"bedrock_id"`
+	JavaID         uuid.UUID `json:"java_id"`
+	JavaName       string    `json:"java_name"`
+	LastNameUpdate int64     `json:"last_name_update"`
+}
+
+// GetLinkedAccount retrieves the linked Java account for a Bedrock XUID from
+// the GeyserMC global link API — the official Floodgate linking service
+// (GlobalPlayerLinking, enable-global-linking defaults to true) that backend
+// Floodgate plugins use in production. It is HTTPS and operated by GeyserMC,
+// the same trust basis as the skin API and the Floodgate plugin ecosystem
+// itself. It is NOT a per-connection signature: Gate only consults it for
+// identity promotion when the operator explicitly enabled the
+// backendFloodgate trust boundary, and failures are fail-closed (the XUID
+// identity stays). A verified Bedrock principal (Connect path) remains the
+// only signed source.
 func (pm *ProfileManager) GetLinkedAccount(xuid int64) (*LinkedAccountResult, error) {
 	var result LinkedAccountResult
 	err := pm.geyserApiGet("link/bedrock/"+strconv.FormatInt(xuid, 10), &result)

@@ -160,6 +160,9 @@ type connectedPlayer struct {
 	clientSettingsPacket *packet.ClientSettings
 	modInfo              *modinfo.ModInfo
 	connPhase            phase.ClientConnectionPhase
+	forgeLoginRelay      *modernForgeLoginRelay  // non-nil during initial Modern Forge login relay
+	forgeReplayRelay     *modernForgeReplayRelay // non-nil during server switch FML replay
+	forgeLoginCache      []forgeLoginExchange    // cached FML exchanges from initial connection
 
 	clientBrand string // may be empty
 
@@ -604,6 +607,7 @@ func (p *connectedPlayer) Disconnect(reason component.Component) {
 	if !p.Active() {
 		return
 	}
+	reason = normalizeDisconnectReason(reason)
 
 	var r string
 	b := new(strings.Builder)
@@ -696,6 +700,12 @@ func (p *connectedPlayer) config() *config.Config {
 
 // switchToConfigState switches the connection of the client into config state.
 func (p *connectedPlayer) switchToConfigState() {
+	if p.bundleHandler.InBundleSession() {
+		p.bundleHandler.ToggleBundleSession()
+		if err := p.BufferPacket(new(packet.BundleDelimiter)); err != nil {
+			p.log.Error(err, "error writing bundle delimiter")
+		}
+	}
 	if err := p.BufferPacket(new(cfgpacket.StartUpdate)); err != nil {
 		p.log.Error(err, "error writing config packet")
 	}

@@ -283,6 +283,22 @@ func (e *PreLoginEvent) Conn() Inbound {
 	return e.connection
 }
 
+// SetVirtualHost replaces the virtual host for the connecting player.
+// It is intended for integrations that decode proxy metadata from the
+// handshake host and need later routing/backend handshakes to see the
+// original clean host.
+func (e *PreLoginEvent) SetVirtualHost(addr net.Addr) bool {
+	type virtualHostSetter interface {
+		setVirtualHost(net.Addr)
+	}
+	setter, ok := e.connection.(virtualHostSetter)
+	if !ok {
+		return false
+	}
+	setter.setVirtualHost(addr)
+	return true
+}
+
 // Result returns the current result of the PreLoginEvent.
 func (e *PreLoginEvent) Result() PreLoginResult {
 	return e.result
@@ -324,10 +340,17 @@ func (e *PreLoginEvent) ForceOfflineMode() {
 //
 
 type LoginEvent struct {
-	player Player
+	player       Player
+	serverIDHash string // server ID hash sent to Mojang for authentication, empty if offline-mode
 
 	denied bool
 	reason component.Component
+}
+
+// ServerIDHash returns the server ID hash that was sent to Mojang to authenticate the player.
+// Returns empty string if the connection was in offline-mode.
+func (e *LoginEvent) ServerIDHash() string {
+	return e.serverIDHash
 }
 
 func (e *LoginEvent) Player() Player {
@@ -1041,6 +1064,54 @@ func (e *ServerResourcePackSendEvent) SetProvidedResourcePack(pack ResourcePackI
 //
 //
 
+// ServerResourcePackRemoveEvent is fired when the downstream server tries to remove a
+// resource pack from the player. If PackID returns uuid.Nil, the downstream server
+// requested that all resource packs should be removed. If this event is denied, the
+// remove packet is not forwarded to the client and the proxy keeps its applied
+// resource pack state unchanged.
+type ServerResourcePackRemoveEvent struct {
+	denied     bool
+	packID     uuid.UUID
+	serverConn *serverConnection
+}
+
+// newServerResourcePackRemoveEvent creates a new ServerResourcePackRemoveEvent.
+func newServerResourcePackRemoveEvent(
+	packID uuid.UUID,
+	serverConn *serverConnection,
+) *ServerResourcePackRemoveEvent {
+	return &ServerResourcePackRemoveEvent{
+		packID:     packID,
+		serverConn: serverConn,
+	}
+}
+
+// Allowed indicates whether removing the resource pack from the client is allowed.
+func (e *ServerResourcePackRemoveEvent) Allowed() bool {
+	return !e.denied
+}
+
+// SetAllowed allows or denies removing the resource pack from the client.
+func (e *ServerResourcePackRemoveEvent) SetAllowed(allowed bool) {
+	e.denied = !allowed
+}
+
+// ServerConnection returns the associated server connection.
+func (e *ServerResourcePackRemoveEvent) ServerConnection() ServerConnection {
+	return e.serverConn
+}
+
+// PackID returns the resource pack ID requested for removal, or uuid.Nil when
+// all resource packs should be removed.
+func (e *ServerResourcePackRemoveEvent) PackID() uuid.UUID {
+	return e.packID
+}
+
+//
+//
+//
+//
+
 // PlayerChannelRegisterEvent is fired when a client Player sends a plugin message through the
 // register channel. The proxy will not wait on this event to finish firing.
 type PlayerChannelRegisterEvent struct {
@@ -1089,6 +1160,7 @@ type ServerLoginPluginMessageEvent struct {
 	id         message.ChannelIdentifier
 	contents   []byte
 	sequenceID int
+	serverConn *serverConnection
 
 	result ServerLoginPluginMessageResult
 }
@@ -1101,6 +1173,11 @@ func (e *ServerLoginPluginMessageEvent) Contents() []byte {
 // SequenceID returns the sequence id of the login plugin message sent by the server.
 func (e *ServerLoginPluginMessageEvent) SequenceID() int {
 	return e.sequenceID
+}
+
+// ServerConnection returns the associated server connection.
+func (e *ServerLoginPluginMessageEvent) ServerConnection() ServerConnection {
+	return e.serverConn
 }
 
 func (e *ServerLoginPluginMessageEvent) Result() *ServerLoginPluginMessageResult {

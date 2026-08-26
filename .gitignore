@@ -6,3 +6,5 @@ tmp
 ./gate
 .aider*
 .web/
+.DS_Store
+config-forge-test.yml

@@ -1,11 +1,11 @@
 ---
-title: "Gate Minecraft Proxy with Modded Servers - Fabric & NeoForge"
-description: "Complete guide to using Gate with modded Minecraft servers including Fabric and NeoForge. Velocity modern forwarding, player info forwarding, and mod compatibility."
+title: "Gate Minecraft Proxy with Modded Servers - Fabric, Forge & NeoForge"
+description: "Complete guide to using Gate with modded Minecraft servers including Fabric, Forge 1.13-1.20.1, and NeoForge. Velocity modern forwarding, player info forwarding, and mod compatibility."
 ---
 
 # Modded Server Compatibility
 
-Gate provides excellent compatibility with modded Minecraft servers including **Fabric** and **NeoForge**. This guide will help you set up Gate to work seamlessly with your modded servers.
+Gate provides excellent compatibility with modded Minecraft servers including **Fabric**, **Forge** (1.13–1.20.1), and **NeoForge**. This guide will help you set up Gate to work seamlessly with your modded servers.
 
 ## Overview
 
@@ -17,6 +17,29 @@ Gate provides comprehensive support for modded Minecraft servers, implementing t
 - **Legacy BungeeCord forwarding** - Compatible with older versions and servers
 - **BungeeGuard forwarding** - Enhanced security over legacy forwarding
 - **No forwarding** - Basic proxy functionality without player data forwarding
+
+::: danger Player info forwarding requires full proxy mode, not Lite mode
+[Gate Lite](/guide/lite) **cannot do velocity/modern (or BungeeCord/BungeeGuard) forwarding**. Lite
+pipes the player connection through to the backend unchanged, so Gate never sends player info and
+`forwarding.mode`, `velocitySecret`, and `bungeeGuardSecret` are ignored. Gate warns at startup when
+a forwarding mode other than `none`/`legacy` or either secret is set.
+
+A backend behind Lite must therefore **not require proxy forwarding**: leave the forwarding mod
+disabled (or uninstalled) and keep `online-mode=true` in `server.properties`. Otherwise the mod
+rejects every player with its own message:
+
+> You need to be running velocity, or a velocity proxy with modern forwarding.
+
+To use forwarding, run Gate in full proxy mode instead: set `lite.enabled: false` and route with
+`servers` + `try` as shown in the configs below.
+:::
+
+::: tip A different MOTD after switching from Lite to full mode is expected
+In Lite mode the server list ping is proxied from the backend, so players see the **backend's**
+MOTD and player count. In full proxy mode Gate answers the ping itself with `status.motd` and
+`status.showMaxPlayers`. The change is expected, not a bug — configure `status` in your Gate
+config to get the MOTD you want.
+:::
 
 ## Fabric Server Setup
 
@@ -146,6 +169,52 @@ config:
 
 :::
 
+## Forge 1.13–1.20.1 Server Setup
+
+Gate has built-in support for Forge 1.13–1.20.1 (FML2/FML3). During login, Gate relays the Forge mod negotiation (`fml:loginwrapper` LoginPluginMessages) between the backend and the client — no client-side mods required. This is similar to what [Ambassador](https://modrinth.com/plugin/ambassador) does for Velocity.
+
+::: info Forge 1.20.2+ uses the CONFIG phase
+For Forge/NeoForge 1.20.2 and above, mod negotiation happens in the CONFIG phase (after login), which Gate handles natively. The login relay described here is only needed for 1.13–1.20.1.
+:::
+
+### Required Mods (Server-Side Only)
+
+For **Velocity modern forwarding**, install [Proxy-Compatible-Forge (PCF)](https://modrinth.com/mod/proxy-compatible-forge) on the Forge server to handle player info forwarding. For **legacy BungeeCord forwarding**, you can use [BungeeForge](https://github.com/caunt/BungeeForge) instead — no PCF needed.
+
+### Server Configuration
+
+::: code-group
+
+```properties [server.properties]
+server-port=25566
+online-mode=false # [!code ++]
+```
+
+```toml [config/proxy-compatible-forge.toml]
+[forwarding]
+    enabled = true
+    mode = "MODERN"
+    secret = "your-secret-key-here" # [!code ++]
+```
+
+```yaml [Gate config.yml]
+config:
+  bind: 0.0.0.0:25565
+  servers:
+    forge-server: localhost:25566
+  try:
+    - forge-server
+  forwarding:
+    mode: velocity # [!code ++]
+    velocitySecret: 'your-secret-key-here' # [!code ++]
+```
+
+:::
+
+### Server Switching
+
+When switching a player between Forge servers, Gate replays the cached FML handshake responses from the initial connection. This works transparently when the servers have compatible mod lists (same mods and registries). If the servers are incompatible, the player will be disconnected.
+
 ## Multi-Server Setup
 
 You can run both Fabric and NeoForge servers behind the same Gate proxy:
@@ -186,6 +255,11 @@ config:
 
 #### Forwarding Issues
 
+- **Lite mode** - `"You need to be running velocity, or a velocity proxy with modern forwarding"`
+  most often means Gate runs in [Lite mode](/guide/lite), which cannot forward player info at all.
+  Check Gate's startup log for a `config validation warn` about `forwarding.mode`, then either set
+  `lite.enabled: false` (and route with `servers` + `try`), or stop the backend mod from requiring
+  forwarding
 - **Secret mismatch** - ensure `velocitySecret` matches in both Gate and mod configs
 - **Online mode** - must be `false` on backend servers when using forwarding
 - **Mod compatibility** - verify the forwarding mod supports your server version

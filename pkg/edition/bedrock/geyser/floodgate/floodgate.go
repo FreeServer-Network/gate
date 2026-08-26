@@ -59,7 +59,10 @@ func (f *Floodgate) Encrypt(data []byte) ([]byte, error) {
 func (f *Floodgate) ReadHostname(hostname string) (string, *BedrockData, error) {
 	parts := strings.Split(hostname, "\u0000")
 	if len(parts) != 2 {
-		return "", nil, fmt.Errorf("invalid hostname format: %s", hostname)
+		// The raw hostname can embed Floodgate identity data and must never
+		// appear in the error; report only structural information.
+		return "", nil, fmt.Errorf("invalid hostname format: expected 2 NUL-separated parts, got %d (hostname length %d)",
+			len(parts), len(hostname))
 	}
 
 	originalHostname := parts[0]
@@ -83,6 +86,49 @@ func (f *Floodgate) ReadHostname(hostname string) (string, *BedrockData, error) 
 	}
 
 	return originalHostname, bedrockData, nil
+}
+
+// WriteHostname encodes Bedrock player data into a Floodgate hostname payload.
+func (f *Floodgate) WriteHostname(originalHostname string, d *BedrockData) (string, error) {
+	if d == nil {
+		return "", fmt.Errorf("bedrock data must not be nil")
+	}
+	if strings.ContainsRune(originalHostname, '\x00') {
+		return "", fmt.Errorf("original hostname must not contain NUL")
+	}
+	fields := []string{
+		d.Version,
+		d.Username,
+		strconv.FormatInt(d.Xuid, 10),
+		strconv.Itoa(d.DeviceOS.ID),
+		d.Language,
+		strconv.Itoa(d.UIProfile),
+		strconv.Itoa(d.InputMode),
+		d.IP,
+		d.LinkedPlayer,
+		boolString(d.Proxy),
+		d.SubscribeID,
+		d.VerifyCode,
+	}
+	for _, field := range fields {
+		if strings.ContainsRune(field, '\x00') {
+			return "", fmt.Errorf("bedrock data fields must not contain NUL")
+		}
+	}
+	data := strings.Join(fields, "\x00")
+
+	encrypted, err := f.Encrypt([]byte(data))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s\x00%s", originalHostname, encrypted), nil
+}
+
+func boolString(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 // ReadBedrockData parses the decrypted Bedrock data string.
@@ -135,6 +181,67 @@ func ReadBedrockData(data string) (*BedrockData, error) {
 		SubscribeID:  parts[10],
 		VerifyCode:   parts[11],
 	}, nil
+}
+
+// LinkedPlayer is a parsed Floodgate linked Java account from the handshake
+// triplet. It serializes on the wire as "javaUsername;javaUUID;bedrockUUID".
+// An absent link is serialized by Floodgate as the literal string "null".
+type LinkedPlayer struct {
+	JavaUsername string
+	JavaUUID     uuid.UUID
+	BedrockUUID  uuid.UUID
+}
+
+// ParseLinkedPlayer parses the Floodgate LinkedPlayer field (field index 8 of
+// the BedrockData wire format) into a LinkedPlayer. It returns nil for an
+// absent link ("" or the literal "null") and for any malformed triplet,
+// matching Floodgate's LinkedPlayer.fromString semantics (exactly three
+// ';'-separated parts, both UUIDs parseable, non-empty Java username).
+func ParseLinkedPlayer(raw string) *LinkedPlayer {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ";")
+	if len(parts) != 3 {
+		return nil
+	}
+	javaUsername := parts[0]
+	if javaUsername == "" {
+		return nil
+	}
+	javaUUID, err := uuid.Parse(parts[1])
+	if err != nil {
+		return nil
+	}
+	bedrockUUID, err := uuid.Parse(parts[2])
+	if err != nil {
+		return nil
+	}
+	return &LinkedPlayer{
+		JavaUsername: javaUsername,
+		JavaUUID:     javaUUID,
+		BedrockUUID:  bedrockUUID,
+	}
+}
+
+// FloodgateJavaUuid returns the UUID Floodgate derives from an XUID
+// (Utils.getJavaUuid: new UUID(0, xuid)). It is the Bedrock side UUID stored
+// in a LinkedPlayer triplet and is how Floodgate identifies a Bedrock
+// connection, distinct from JavaUuid which is Gate's own deterministic
+// XUID-derived profile UUID.
+func (d *BedrockData) FloodgateJavaUuid() uuid.UUID {
+	var u uuid.UUID
+	// new UUID(0, xuid): most-significant 64 bits zero, XUID as the
+	// least-significant 64 bits (big-endian).
+	u[8] = byte(d.Xuid >> 56)
+	u[9] = byte(d.Xuid >> 48)
+	u[10] = byte(d.Xuid >> 40)
+	u[11] = byte(d.Xuid >> 32)
+	u[12] = byte(d.Xuid >> 24)
+	u[13] = byte(d.Xuid >> 16)
+	u[14] = byte(d.Xuid >> 8)
+	u[15] = byte(d.Xuid)
+	return u
 }
 
 // JavaUuid generates a Java Edition UUID from the Bedrock XUID.

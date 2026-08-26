@@ -6,6 +6,8 @@ import (
 	"math"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -15,11 +17,59 @@ import (
 	"go.minekube.com/gate/pkg/edition/bedrock/config"
 	"go.minekube.com/gate/pkg/edition/bedrock/geyser/floodgate"
 	"go.minekube.com/gate/pkg/edition/bedrock/geyser/managed"
+	"go.minekube.com/gate/pkg/edition/java/lite"
 	"go.minekube.com/gate/pkg/edition/java/profile"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/util/errs"
+	"go.minekube.com/gate/pkg/util/netutil"
 	"go.minekube.com/gate/pkg/util/uuid"
 )
+
+type managedRunner interface {
+	EnsureKey(context.Context) error
+	Start(context.Context) error
+	Stop()
+}
+
+type javaManagedRunner struct {
+	runner *managed.Runner
+}
+
+func newJavaManagedRunner(cfg *config.Config) *javaManagedRunner {
+	return &javaManagedRunner{runner: managed.New(cfg)}
+}
+
+func (r *javaManagedRunner) EnsureKey(ctx context.Context) error {
+	return r.runner.EnsureKey(ctx)
+}
+
+func (r *javaManagedRunner) Start(ctx context.Context) error {
+	jar, err := r.runner.Ensure(ctx)
+	if err != nil {
+		return fmt.Errorf("managed java geyser ensure failed: %w", err)
+	}
+	if err := r.runner.Start(ctx, jar); err != nil {
+		return fmt.Errorf("managed java geyser start failed: %w", err)
+	}
+	return nil
+}
+
+func (r *javaManagedRunner) Stop() {
+	r.runner.Stop()
+}
+
+func newManagedRunner(cfg *config.Config) (managedRunner, error) {
+	managedConfig := cfg.GetManaged()
+	switch managedConfig.Engine {
+	case "", config.ManagedEngineGeyserlite:
+		return newLiteManagedRunner(cfg), nil
+	case config.ManagedEngineJava:
+		return newJavaManagedRunner(cfg), nil
+	default:
+		return nil, fmt.Errorf("unknown managed geyser engine %q (want %q or %q)",
+			managedConfig.Engine, config.ManagedEngineGeyserlite, config.ManagedEngineJava)
+	}
+}
 
 // Integration provides Geyser integration for Gate.
 type Integration struct {
@@ -33,7 +83,8 @@ type Integration struct {
 	connections    map[net.Addr]*GeyserConnection
 	mu             sync.RWMutex
 	unsubs         []func()
-	manager        *managed.Runner
+	unregisterHook func()
+	manager        managedRunner
 }
 
 // GeyserConnection represents a connection from Geyser.
@@ -41,7 +92,8 @@ type GeyserConnection struct {
 	context.Context
 	net.Conn
 	*floodgate.BedrockData
-	closeCb func()
+	OriginalHost string
+	closeCb      func()
 }
 
 func (c *GeyserConnection) Close() error {
@@ -73,10 +125,14 @@ func NewIntegration(ctx context.Context, p *proxy.Proxy, cfg *config.Config) (*I
 
 	managedConfig := cfg.GetManaged()
 	if managedConfig.Enabled {
-		// Create a config copy with the resolved managed settings
 		configCopy := *cfg
 		configCopy.Managed = &managedConfig
-		integration.manager = managed.New(&configCopy)
+		manager, err := newManagedRunner(&configCopy)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		integration.manager = manager
 
 		// In managed mode, ensure key exists before reading it
 		if err := integration.manager.EnsureKey(ctx); err != nil {
@@ -95,6 +151,9 @@ func NewIntegration(ctx context.Context, p *proxy.Proxy, cfg *config.Config) (*I
 		return nil, fmt.Errorf("failed to initialize floodgate: %w", err)
 	}
 	integration.floodgate = fg
+	if cfg.BackendFloodgate.Enabled {
+		integration.unregisterHook = p.SetBackendHandshakeAddresser(integration)
+	}
 
 	return integration, nil
 }
@@ -110,24 +169,23 @@ func (i *Integration) Start() error {
 	unsubProf := event.Subscribe(eventMgr, priority, i.onGameProfile)
 	i.unsubs = append(i.unsubs, unsubPre, unsubProf)
 
-	// If managed mode enabled, ensure and start Geyser Standalone
-	if i.manager != nil {
-		jar, err := i.manager.Ensure(i.ctx)
-		if err != nil {
-			return fmt.Errorf("managed geyser ensure failed: %w", err)
-		}
-		if err := i.manager.Start(i.ctx, jar); err != nil {
-			return fmt.Errorf("managed geyser start failed: %w", err)
-		}
-		// Start method now waits for Geyser to be ready internally
+	ln, err := i.listen()
+	if err != nil {
+		return err
 	}
-
-	// Start listening for Geyser connections
 	go func() {
-		if err := i.listenAndServe(); err != nil {
+		if err := i.serve(ln); err != nil {
 			i.log.Error(err, "geyser listener failed")
 		}
 	}()
+
+	// If managed mode enabled, ensure and start Geyser Standalone
+	if i.manager != nil {
+		if err := i.manager.Start(i.ctx); err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("managed geyser start failed: %w", err)
+		}
+	}
 
 	i.log.Info("geyser integration started", "addr", i.config.GeyserListenAddr)
 	return nil
@@ -157,18 +215,26 @@ func (i *Integration) Stop() {
 	if i.manager != nil {
 		i.manager.Stop()
 	}
+	if i.unregisterHook != nil {
+		i.unregisterHook()
+		i.unregisterHook = nil
+	}
 }
 
-func (i *Integration) listenAndServe() error {
+func (i *Integration) listen() (net.Listener, error) {
 	if i.ctx.Err() != nil {
-		return i.ctx.Err()
+		return nil, i.ctx.Err()
 	}
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(i.ctx, "tcp", i.config.GeyserListenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", i.config.GeyserListenAddr, err)
+		return nil, fmt.Errorf("failed to listen on %s: %w", i.config.GeyserListenAddr, err)
 	}
+	return ln, nil
+}
+
+func (i *Integration) serve(ln net.Listener) error {
 	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithCancel(i.ctx)
@@ -237,20 +303,21 @@ func (i *Integration) onPreLogin(e *proxy.PreLoginEvent) {
 	if hostname := e.Conn().VirtualHost(); hostname != nil {
 		originalHost, bedrockData, err := i.floodgate.ReadHostname(hostname.String())
 		if err != nil || originalHost == "" || bedrockData == nil {
-			i.log.Info("disconnecting bedrock player: failed to read hostname",
-				"error", err, "hostname", hostname.String())
+			// The raw hostname may embed Floodgate identity data and is never logged.
+			i.log.Info("disconnecting bedrock player: failed to read hostname", "error", err)
 			e.Deny(&component.Text{Content: "Failed to read bedrock hostname"})
 			return
 		}
 
 		geyserConn.BedrockData = bedrockData
+		geyserConn.OriginalHost = originalHost
+		e.SetVirtualHost(cleanedVirtualHost(hostname, originalHost))
 
 		// Force offline mode for Bedrock players (Floodgate handles auth)
 		e.ForceOfflineMode()
 
+		// No raw identity (username, XUID, linked Java identity) in logs.
 		i.log.Info("bedrock player connecting",
-			"username", bedrockData.Username,
-			"xuid", bedrockData.Xuid,
 			"device_os", bedrockData.DeviceOS,
 			"language", bedrockData.Language,
 			"original_host", originalHost)
@@ -269,8 +336,7 @@ func (i *Integration) onGameProfile(e *proxy.GameProfileRequestEvent) {
 	// Generate UUID from XUID
 	uid, err := bedrockData.JavaUuid()
 	if err != nil || uid == uuid.Nil {
-		i.log.Info("disconnecting bedrock player: failed to get UUID from XUID",
-			"error", err, "xuid", bedrockData.Xuid)
+		i.log.Info("disconnecting bedrock player: failed to get UUID from XUID", "error", err)
 		geyserConn.Close()
 		return
 	}
@@ -279,6 +345,39 @@ func (i *Integration) onGameProfile(e *proxy.GameProfileRequestEvent) {
 	formattedName := bedrockData.Username
 	if i.config.UsernameFormat != "" {
 		formattedName = fmt.Sprintf(i.config.UsernameFormat, bedrockData.Username)
+	}
+	formattedName = javaCompatibleUsername(formattedName)
+
+	// Opt-in linked Java identity, gated on the backendFloodgate trust switch
+	// (default off). Two sources, in priority order:
+	//
+	//  1. AES-authenticated Floodgate handshake triplet. Only parties holding
+	//     the shared Floodgate key can produce it; it needs no network and is
+	//     the authoritative data for this connection. It is cross-checked so a
+	//     link can only ever be applied to the Bedrock connection it was
+	//     issued for: the triplet's Bedrock UUID must equal this connection's
+	//     own Floodgate bedrock UUID (new UUID(0, xuid)).
+	//  2. GeyserMC global link API fallback (used when the handshake carries
+	//     no triplet, e.g. standalone Geyser). This is the official Floodgate
+	//     linking service (GlobalPlayerLinking, enable-global-linking default
+	//     true) that backend Floodgate plugins use in production; HTTPS,
+	//     operated by GeyserMC, same trust basis as the skin API below.
+	//     Fail-closed: an API error leaves the XUID-derived identity.
+	//
+	// The unauthenticated GeyserMC hint is never consulted outside this opt-in
+	// boundary, and linked identity from signed authoritative provenance (the
+	// verified Bedrock principal on the Connect proposal path) is applied
+	// separately and is untouched.
+	if i.config.BackendFloodgate.Enabled {
+		if link := floodgate.ParseLinkedPlayer(bedrockData.LinkedPlayer); link != nil &&
+			link.BedrockUUID == bedrockData.FloodgateJavaUuid() {
+			uid = link.JavaUUID
+			formattedName = javaCompatibleUsername(link.JavaUsername)
+		} else if linked, err := i.profileManager.GetLinkedAccount(bedrockData.Xuid); err == nil &&
+			linked != nil && linked.JavaID != uuid.Nil {
+			uid = linked.JavaID
+			formattedName = javaCompatibleUsername(linked.JavaName)
+		}
 	}
 
 	// Create base game profile
@@ -294,21 +393,129 @@ func (i *Integration) onGameProfile(e *proxy.GameProfileRequestEvent) {
 			Value:     skin.Value,
 			Signature: skin.Signature,
 		})
-		i.log.V(1).Info("applied bedrock skin", "username", formattedName, "texture_id", skin.TextureID)
-	}
-
-	// Check for linked Java account
-	if linkedAccount, err := i.profileManager.GetLinkedAccount(bedrockData.Xuid); err == nil && linkedAccount != nil && linkedAccount.JavaID != uuid.Nil {
-		// Use linked Java account details
-		i.log.Info("bedrock player using linked java account",
-			"bedrock_name", bedrockData.Username,
-			"java_name", linkedAccount.JavaName,
-			"java_uuid", linkedAccount.JavaID)
-
-		gameProfile.ID = linkedAccount.JavaID
-		gameProfile.Name = linkedAccount.JavaName
-		// TODO: Get skin for linked Java account if needed
+		i.log.V(1).Info("applied bedrock skin", "texture_id", skin.TextureID)
 	}
 
 	e.SetGameProfile(gameProfile)
+}
+
+// javaCompatibleUsername makes a Bedrock gamertag safe for the Java profile
+// boundary. Bedrock names may contain spaces and other characters that modern
+// Java servers reject, while Java profile names are limited to 16 ASCII
+// letters, digits, and underscores.
+func javaCompatibleUsername(name string) string {
+	const maxJavaUsernameLen = 16
+
+	var normalized strings.Builder
+	normalized.Grow(min(len(name), maxJavaUsernameLen))
+	for _, r := range name {
+		if normalized.Len() == maxJavaUsernameLen {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			normalized.WriteByte(byte(r))
+		default:
+			normalized.WriteByte('_')
+		}
+	}
+
+	if normalized.Len() == 0 {
+		return "_"
+	}
+	return normalized.String()
+}
+
+func cleanedVirtualHost(current net.Addr, originalHost string) net.Addr {
+	network := "tcp"
+	currentPort := uint16(0)
+	if current != nil {
+		network = current.Network()
+		currentPort = virtualHostPort(current)
+	}
+	host, port := splitOriginalHostPort(originalHost)
+	if port == 0 {
+		port = currentPort
+	}
+	host = lite.ClearVirtualHost(host)
+	if port == 0 {
+		return netutil.NewAddr(host, network)
+	}
+	return netutil.NewAddr(net.JoinHostPort(host, strconv.Itoa(int(port))), network)
+}
+
+func virtualHostPort(addr net.Addr) uint16 {
+	_, port := netutil.HostPort(addr)
+	if port != 0 {
+		return port
+	}
+	host := addr.String()
+	if !strings.Contains(host, "\x00") {
+		return 0
+	}
+	idx := strings.LastIndex(host, ":")
+	if idx == -1 || idx == len(host)-1 {
+		return 0
+	}
+	portInt, err := strconv.Atoi(host[idx+1:])
+	if err != nil || portInt <= 0 || portInt > 65535 {
+		return 0
+	}
+	return uint16(portInt)
+}
+
+func splitOriginalHostPort(originalHost string) (string, uint16) {
+	host, portStr, err := net.SplitHostPort(originalHost)
+	if err == nil {
+		port, err := strconv.Atoi(portStr)
+		if err == nil && port > 0 && port <= 65535 {
+			return host, uint16(port)
+		}
+		return host, 0
+	}
+	if strings.HasPrefix(originalHost, "[") && strings.HasSuffix(originalHost, "]") {
+		return strings.TrimSuffix(strings.TrimPrefix(originalHost, "["), "]"), 0
+	}
+	return originalHost, 0
+}
+
+// BackendHandshakeAddr re-attaches verified Floodgate hostname data for
+// allowlisted backend Floodgate plugins.
+func (i *Integration) BackendHandshakeAddr(defaultServerAddress string, player proxy.Player, target proxy.RegisteredServer) (string, error) {
+	if i == nil || i.config == nil || !i.config.BackendFloodgate.Enabled {
+		return defaultServerAddress, nil
+	}
+	if strings.ContainsRune(defaultServerAddress, '\x00') {
+		return "", fmt.Errorf("refusing backend Floodgate hostname prefix containing NUL")
+	}
+	if !i.backendFloodgateAllowed(target) {
+		return defaultServerAddress, nil
+	}
+
+	geyserConn, ok := FromContext(player.Context())
+	if !ok || geyserConn.BedrockData == nil {
+		return defaultServerAddress, nil
+	}
+	if i.floodgate == nil {
+		return "", fmt.Errorf("backend Floodgate is enabled but Floodgate is not initialized")
+	}
+
+	encoded, err := i.floodgate.WriteHostname(defaultServerAddress, geyserConn.BedrockData)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode backend Floodgate hostname: %w", err)
+	}
+	return encoded, nil
+}
+
+func (i *Integration) backendFloodgateAllowed(target proxy.RegisteredServer) bool {
+	if target == nil || target.ServerInfo() == nil {
+		return false
+	}
+	targetName := strings.ToLower(target.ServerInfo().Name())
+	for _, name := range i.config.BackendFloodgate.AllowedServers {
+		if strings.ToLower(name) == targetName {
+			return true
+		}
+	}
+	return false
 }

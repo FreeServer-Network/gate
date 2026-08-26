@@ -3,13 +3,14 @@ package lite
 import (
 	"bytes"
 	"context"
-	"encoding/json" 
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,9 +48,12 @@ func Forward(
 ) {
 	defer func() { _ = client.Close() }()
 
-	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
+	log, src, route, routeHost, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
 	if err != nil {
-		errs.V(log, err).Info("failed to find route", "error", err)
+		// A player connection that matches no route is silently dropped, so log it at
+		// the default verbosity: it is always an operator-actionable misconfiguration,
+		// unlike the status pings that findRoute marks as debug-only.
+		log.Info("failed to find route", "error", err)
 		return
 	}
 
@@ -68,12 +72,9 @@ func Forward(
 		return
 	}
 
-	// Track connection for least-connections strategy
-	var decrementConnection func()
-	if route.Strategy == config.StrategyLeastConnections {
-		decrementConnection = strategyManager.IncrementConnection(backendAddr)
-		defer decrementConnection()
-	}
+	// Track connection for all strategies (used by status API and least-connections strategy)
+	decrementConnection := strategyManager.TrackConnection(routeHost, backendAddr)
+	defer decrementConnection()
 
 	log.Info("forwarding connection", "backendAddr", backendAddr)
 	pipe(log, src, dst)
@@ -167,12 +168,13 @@ func findRoute(
 	newLog logr.Logger,
 	src net.Conn,
 	route *config.Route,
+	routeHost string,
 	nextBackend nextBackendFunc,
 	err error,
 ) {
 	srcConn, ok := netmc.Assert[interface{ Conn() net.Conn }](client)
 	if !ok {
-		return log, src, nil, nil, errors.New("failed to assert connection as net.Conn")
+		return log, src, nil, "", nil, errors.New("failed to assert connection as net.Conn")
 	}
 	src = srcConn.Conn()
 
@@ -185,27 +187,31 @@ func findRoute(
 
 	host, route, groups := FindRouteWithGroups(clearedHost, routes...)
 	if route == nil {
-		return log.V(1), src, nil, nil, fmt.Errorf("no route configured for host %s", clearedHost)
+		// Status pings hit unknown hosts constantly, so they keep this out of the
+		// default log via errs.V. Forward logs it unconditionally for players.
+		return log, src, nil, "", nil, &errs.VerbosityError{
+			Err:       fmt.Errorf("no route configured for host %s", clearedHost),
+			Verbosity: 1,
+		}
 	}
 	log = log.WithValues("route", host)
 
 	if len(route.Backend) == 0 {
-		return log, src, route, nil, errors.New("no backend configured for route")
+		return log, src, route, host, nil, errors.New("no backend configured for route")
 	}
 
 	// Make a copy and shuffle the backends for load balancing
 	tryBackends := route.Backend.Copy()
+	for i := range tryBackends {
+		tryBackends[i] = substituteBackendParams(tryBackends[i], groups)
+	}
 	rand.Shuffle(len(tryBackends), func(i, j int) {
 		tryBackends[i], tryBackends[j] = tryBackends[j], tryBackends[i]
 	})
-	
 	nextBackend = func() (string, logr.Logger, bool) {
 		if len(tryBackends) == 0 {
 			return "", log, false
 		}
-		// Pop random backend
-		backend := tryBackends[0] 
-		tryBackends = tryBackends[1:]
 
 		// Always use strategy manager (it handles empty strategy as sequential default)
 		backendAddr, newLog, ok := strategyManager.GetNextBackend(log, route, host, tryBackends)
@@ -213,20 +219,9 @@ func findRoute(
 			return "", log, false
 		}
 
-		// Substitute parameters in backend address if groups were captured
-		if len(groups) > 0 {
-			backendAddr = substituteBackendParams(backendAddr, groups)
-		}
-
 		// Remove selected backend from list to avoid retrying it
 		for i, backend := range tryBackends {
-			// Apply parameter substitution to the original backend for comparison
-			originalBackend := backend
-			if len(groups) > 0 {
-				originalBackend = substituteBackendParams(backend, groups)
-			}
-
-			normalizedBackend, err := netutil.Parse(originalBackend, src.RemoteAddr().Network())
+			normalizedBackend, err := netutil.Parse(backend, src.RemoteAddr().Network())
 			if err != nil {
 				continue
 			}
@@ -253,7 +248,7 @@ func findRoute(
 		return backendAddr, newLog.WithValues("backendAddr", backendAddr), true
 	}
 
-	return log, src, route, nextBackend, nil
+	return log, src, route, host, nextBackend, nil
 }
 
 func dialRoute(
@@ -356,7 +351,22 @@ func ResolveStatusResponse(
 	statusRequestCtx *proto.PacketContext,
 	strategyManager *StrategyManager,
 ) (logr.Logger, *packet.StatusResponse, error) {
-	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
+	return ResolveStatusResponseWithGeneration(dialTimeout, 0, routes, log, client, handshake, handshakeCtx, statusRequestCtx, strategyManager)
+}
+
+// ResolveStatusResponseWithGeneration resolves a status response with a route snapshot generation.
+func ResolveStatusResponseWithGeneration(
+	dialTimeout time.Duration,
+	routeGeneration uint64,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	statusRequestCtx *proto.PacketContext,
+	strategyManager *StrategyManager,
+) (logr.Logger, *packet.StatusResponse, error) {
+	log, src, route, _, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
 	if err != nil {
 		return log, nil, err
 	}
@@ -364,7 +374,7 @@ func ResolveStatusResponse(
 	_, log, res, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, *packet.StatusResponse, error) {
 		// Measure status response time for latency tracking (better than dial time)
 		start := time.Now()
-		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx)
+		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, routeGeneration, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx)
 		statusLatency := time.Since(start)
 
 		// Record latency for lowest-latency strategy (only on success)
@@ -417,24 +427,22 @@ func handleFallbackResponse(log logr.Logger, route *config.Route, protocol proto
 	return nil, log
 }
 
-var (
-	pingCache = ttlcache.New[pingKey, *pingResult]()
-	sfg       = new(singleflight.Group)
-)
+var pingCache = newPingStatusCache(time.Now, new(singleflight.Group))
 
-// ResetPingCache resets the ping cache.
+// ResetPingCache clears cached ping results and prevents in-flight loads from repopulating them.
 func ResetPingCache() {
-	pingCache.DeleteAll()
+	pingCache.reset()
 	compiledRegexCache.DeleteAll()
 }
 
 func init() {
-	go pingCache.Start() // start ttl eviction once
+	go pingCache.cache.Start() // start ttl eviction once
 }
 
 type pingKey struct {
-	backendAddr string
-	protocol    proto.Protocol
+	backendAddr     string
+	protocol        proto.Protocol
+	routeGeneration uint64
 }
 
 type pingResult struct {
@@ -442,9 +450,87 @@ type pingResult struct {
 	err error
 }
 
+type flightGroup interface {
+	DoChan(string, func() (any, error)) <-chan singleflight.Result
+}
+
+type pingStatusCache struct {
+	mu         sync.Mutex
+	cache      *ttlcache.Cache[pingKey, *pingResult]
+	group      flightGroup
+	now        func() time.Time
+	generation uint64
+}
+
+func newPingStatusCache(now func() time.Time, group flightGroup) *pingStatusCache {
+	return &pingStatusCache{
+		cache: ttlcache.New[pingKey, *pingResult](ttlcache.WithDisableTouchOnHit[pingKey, *pingResult]()),
+		group: group,
+		now:   now,
+	}
+}
+
+func (c *pingStatusCache) get(key pingKey) *pingResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getLocked(key)
+}
+
+func (c *pingStatusCache) getLocked(key pingKey) *pingResult {
+	item := c.cache.Get(key)
+	if item == nil {
+		return nil
+	}
+	expiresAt := item.ExpiresAt()
+	if !expiresAt.IsZero() && !c.now().Before(expiresAt) {
+		c.cache.Delete(key)
+		return nil
+	}
+	return item.Value()
+}
+
+func (c *pingStatusCache) load(key pingKey, ttl time.Duration, load func() *pingResult) *pingResult {
+	c.mu.Lock()
+	generation := c.generation
+	if result := c.getLocked(key); result != nil {
+		c.mu.Unlock()
+		return result
+	}
+	c.mu.Unlock()
+
+	flightKey := fmt.Sprintf("%d:%d:%s:%d", generation, key.routeGeneration, key.backendAddr, key.protocol)
+	result := <-c.group.DoChan(flightKey, func() (any, error) {
+		c.mu.Lock()
+		if generation == c.generation {
+			if cached := c.getLocked(key); cached != nil {
+				c.mu.Unlock()
+				return cached, nil
+			}
+		}
+		c.mu.Unlock()
+
+		loaded := load()
+		c.mu.Lock()
+		if generation == c.generation {
+			c.cache.Set(key, loaded, ttl)
+		}
+		c.mu.Unlock()
+		return loaded, nil
+	})
+	return result.Val.(*pingResult)
+}
+
+func (c *pingStatusCache) reset() {
+	c.mu.Lock()
+	c.generation++
+	c.cache.DeleteAll()
+	c.mu.Unlock()
+}
+
 func resolveStatusResponse(
 	src net.Conn,
 	dialTimeout time.Duration,
+	routeGeneration uint64,
 	backendAddr string,
 	route *config.Route,
 	log logr.Logger,
@@ -453,14 +539,13 @@ func resolveStatusResponse(
 	handshakeCtx *proto.PacketContext,
 	statusRequestCtx *proto.PacketContext,
 ) (logr.Logger, *packet.StatusResponse, error) {
-	key := pingKey{backendAddr, proto.Protocol(handshake.ProtocolVersion)}
+	key := pingKey{backendAddr, proto.Protocol(handshake.ProtocolVersion), routeGeneration}
 
 	// fast path: use cache without loader
 	if route.CachePingEnabled() {
-		item := pingCache.Get(key)
-		if item != nil {
+		val := pingCache.get(key)
+		if val != nil {
 			log.V(1).Info("returning cached status result")
-			val := item.Value()
 			return log, val.res, val.err
 		}
 	}
@@ -492,13 +577,13 @@ func resolveStatusResponse(
 		return log, res, err
 	}
 
-	opt := withLoader(sfg, route.GetCachePingTTL(), func(key pingKey) *pingResult {
+	loadResult := func() *pingResult {
 		res, err := load(context.Background())
 		return &pingResult{res: res, err: err}
-	})
+	}
 
 	resultChan := make(chan *pingResult, 1)
-	go func() { resultChan <- pingCache.Get(key, opt).Value() }()
+	go func() { resultChan <- pingCache.load(key, route.GetCachePingTTL(), loadResult) }()
 
 	select {
 	case result := <-resultChan:
@@ -552,18 +637,4 @@ func decodeStatusResponse(dec statusDecoder) (*packet.StatusResponse, error) {
 	}
 
 	return res, nil
-}
-
-// withLoader returns a ttlcache option that uses the given load function to load a value for a key
-// if it is not already cached.
-func withLoader[K comparable, V any](group *singleflight.Group, ttl time.Duration, load func(key K) V) ttlcache.Option[K, V] {
-	loader := ttlcache.LoaderFunc[K, V](
-		func(c *ttlcache.Cache[K, V], key K) *ttlcache.Item[K, V] {
-			v := load(key)
-			return c.Set(key, v, ttl)
-		},
-	)
-	return ttlcache.WithLoader[K, V](
-		ttlcache.NewSuppressedLoader[K, V](loader, group),
-	)
 }
